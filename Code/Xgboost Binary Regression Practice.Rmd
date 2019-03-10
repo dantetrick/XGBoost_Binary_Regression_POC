@@ -1,0 +1,502 @@
+---
+title: XGBoost Binary Regression Model Practice Using Basic Loan Data
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+Daniel Tetrick <dantetrickk@gmail.com>
+
+Date: 2019-03-07
+
+# Introduction
+
+This script is a created to display my skills using machine learning techniques. I will take historical bank lending data found in the Revolution R package and train an XGBoost binary regresssion model to predict future default loans. The data set consists of 100,000 rows of bank mortage data from the years 2000-2009. The columns available are: <creditScore, houseAge, yearsEmploy, ccDebt, year, default>
+
+
+#### Set Project Parameters
+
+Set scientific notation to off and clean garbage.
+```{r, message=FALSE, warning=FALSE}
+
+# Set Project Parameters
+gc()
+options(scipen = 999)
+
+```
+
+
+#### Load all necessary packages
+
+If the output shows a "FALSE" value, use the "install.packages()" to load that package and re-run script. 
+```{r,  message=FALSE, warning=FALSE}
+
+# Load all packages 
+sapply(c("dplyr", "data.table", "plotROC","car","caret", "glmnet", "xgboost"), function(x) {
+  require(x, character.only = T)
+  })
+
+
+```
+
+
+
+#### Set Paths and Create Directories
+```{r,  message=FALSE, echo=FALSE, warning=FALSE}
+
+# Set Paths
+MainPath <- "~/Amazon Technical Test ML/"
+DataPath <- paste0(MainPath, "Data/")
+CodePath <- paste0(MainPath, "Code/")
+GraphicsPath <- paste0(MainPath, "Graphics/")
+
+
+Paths <- list(MainPath, DataPath, CodePath,GraphicsPath)
+sapply(Paths, function(x) dir.create(x))
+
+```
+
+
+#### Load all csv's in data folder and create full data set
+
+Load all data from Data folder as lists of data frames. Bind all dataframes into single data frame and randomize rows. Finally remove year varibale because we won't be using it in the first analysis. In the future, we can add the time element if desired. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Load data
+filesToLoad <- lapply(list.files(DataPath, pattern = ".csv", full.names = T), function(x) {fread(x)})
+
+# Bind All data and mix up
+set.seed(8675309)
+dt <- rbindlist(filesToLoad) %>% 
+  sample_frac(1) %>% 
+  select(-year)
+
+data.table(dt)
+
+```
+
+It is important to note that the data is 'shuffled' here to control for biased sampling later. 
+
+#### Create a Default Data set
+
+Isolate all default loans into a single data set in prep for analysis. Display.
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Separate Defaults and create a test and train data sets
+dt_default <- dt[default == 1, ]
+
+data.table(dt_default)
+
+```
+
+
+#### Create a Default Data set
+Use a scatterplotMatrix from the Car package to look for bi-variate interacations withinn scatter plots and histograms of all variables. 
+```{r,  message=FALSE, warning=FALSE }
+
+# Scatterplot
+defaultScatters <- scatterplotMatrix(dt_default %>% select(creditScore, houseAge, yearsEmploy, ccDebt))
+
+```
+
+
+#### Create a Test and Train dataset of the 'default' values
+
+Create a test data set of 50 rows of data from the 471 overall default loans found. These values will be held aside until we predict our final model. The remaining 421 data points will be used in the training data to create the final model. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Keep all but 50 random default for training data sets
+dt_default_train <- dt_default[1:(nrow(dt_default)-50), ] %>% 
+  select(creditScore, houseAge, yearsEmploy, ccDebt, default)
+
+# Keep th 50 random default for test data sets
+dt_default_test <- dt_default[((nrow(dt_default)-49):nrow(dt_default)), ] %>% 
+  select(creditScore, houseAge, yearsEmploy, ccDebt, default)
+
+```
+
+#### Create Non-default data set and a 200 point sample for testing 
+
+Create a dataset of all non-default mortage data and take 200 values for a test data set. 
+```{r,  message=FALSE, warning=FALSE}
+
+# Separate the nondefault data from default
+dt_nondefault <- dt[default == 0, ]
+
+# Keep 4x as many non default points for testing later
+dt_nondefault_test <- dt_nondefault[1:200,]
+
+```
+
+
+#### Create Full Test data set by unioning the test default and non-default data sets. 
+
+Create a dataset of all non-default mortage data and take 200 values for a test data set. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Separate the nondefault data from default
+dt_nondefault <- dt[default == 0, ]
+
+# Keep 4x as many non default points for testing later
+dt_nondefault_test <- dt_nondefault[1:200,]
+
+```
+
+#### Union default and non-default test data sets 
+Create a 250 row table to be used in prediction later. Dataset consists of 200 non-default and 50 default values. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Create full test data for later
+dt_test <- bind_rows(dt_default_test, dt_nondefault_test) %>% 
+  select(creditScore, houseAge, yearsEmploy, ccDebt, default) %>% 
+  sample_frac(1) %>% 
+  as.matrix()
+
+data.table(dt_test)
+
+```
+
+#### Create xgboost Matrix of test data 
+
+Create a dataset of all non-default mortage data and take 200 values for a test data set. 
+
+```{r,  message=FALSE, warning=FALSE}
+xgbMatrix_test <- xgb.DMatrix(data = dt_test[,1:4]
+                              , label = dt_test[,5]
+                              )
+
+xgbMatrix_test
+```
+
+
+#### Create Non-Default training data set. 
+
+Instead of using the entire 99K+ data set with the 421 default rows, we will take a sample of the data and use it to train the model. Remember to exclude the top 200 rows that have been designated as the test data set to be used in prediction. After top 200 rows are removed, we take a random sample 4x the size of the total number of 'default' values found. The sample size is arbitrary for now, but it is a decent fold size in my experience to get a model working and ready to iterate on. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Remove all testing points from nondefault to create overall training set 
+dt_nondefault_train <- dt_nondefault[201:nrow(dt_nondefault),]
+
+# Create sample data set that is 4x larger than total number of default loand found. 
+set.seed(8675309)
+dt_nondefault_samp <- dt_nondefault_train %>% 
+  sample_n(nrow(dt_default)*4) %>% 
+  select(creditScore, houseAge, yearsEmploy, ccDebt, default) 
+
+data.table(dt_nondefault_samp)
+```
+
+
+#### Create Scatterplot for Non-Default training data
+
+Scatterplot matrix for the non-default data set, juxtapose this with the default data scatterplot earlier. There is a noticeable difference between ccDebt and its interactions with other variables when comparing the two scatter plot matrices. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Create Scatters
+nondefaultScatters_samp <- scatterplotMatrix(dt_nondefault_samp %>% 
+                                               select(-default)
+                                             )
+
+# Scatterplot
+defaultScatters <- scatterplotMatrix(dt_default %>%
+                                       select(creditScore, houseAge, yearsEmploy, ccDebt))
+
+```
+
+
+#### Create Scatterplot for Non-Default training data
+
+Create the model training data set by unioning the non-default sample and the default training data sets. Shuffle the data and create a matrix.
+
+```{r,  message=FALSE, warning=FALSE}
+
+set.seed(8675309)
+dt_train <- bind_rows(dt_nondefault_samp, dt_default_train) %>% 
+  sample_frac(1) %>% 
+  as.matrix()
+```
+
+
+#### Create Xgboost Matrix for training 
+
+Create the Xgboost matrix for the training data set. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+xgbMatrix_train <- xgb.DMatrix(dt_train[, 1:4], label = dt_train[,5])
+
+xgbMatrix_train
+
+```
+
+#### Create Xgboost Matrix for training 
+
+Create a Cross-validated xgboosted binary logistic model. A thousand rounds using a slow and deep learning rate of .01. Using 4 nfolds to create a 75/25 cv. Max depth is 4 but preliminary work showed that 3 and 4 are relatively equal. More work can be done to train the model, but this is a good display, and pretty good. CV example output displayed next code chunk. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+cv <- xgb.cv(data = xgbMatrix_train
+             , nrounds = 1000
+             , nfold = 4
+             , verbose = F
+             , metrics = list("rmse","auc")
+             , max_depth = 4
+             , eta = .01
+             , objective = "binary:logistic"
+             )
+
+
+
+```
+
+
+#### Pick Best CV from the XGBoost evaluation log
+
+Pick best number of rounds of XGboosting by selecting the highest AUC value from the CV matrix. Return the NROUNDS 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Pick the best CV 
+NROUNDS <- cv$evaluation_log[, which(cv$evaluation_log$test_auc_mean == max(cv$evaluation_log$test_auc_mean))[1]]
+
+NROUNDS
+
+```
+
+#### Pick Best CV from the XGBoost evaluation log
+
+Create the final data model by using the NROUNDS chosen by CV. Use same exact parameters used in CV. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+XGBoost_Model <-   xgboost(data = xgbMatrix_train
+                           , nfold = 4
+                           , max.depth = 4
+                           , nrounds = NROUNDS
+                           , nthread = 4
+                           , metrics = list("rmse","auc")
+                           , eta = .01
+                           , verbose = F
+                           , objective = "binary:logistic")
+
+
+```
+
+
+#### Look at importance matrix
+
+Imporance matrix displays a ranking of each variables importance in the model.
+
+```{r,  message=FALSE, warning=FALSE}
+
+data.table(xgb.importance(model = XGBoost_Model))
+
+```
+
+
+#### Predict the xgboost test matrix data using the Xgboost model 
+
+Use the predict function on the xgboost test data and project the values onto the dt_test data set created earlier. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+# Predict Model
+dt_test <- dt_test %>% 
+  tbl_df() %>% 
+  mutate(prediction = predict(XGBoost_Model
+                            , newdata = xgbMatrix_test
+                            ))
+
+data.table(dt_test)
+
+```
+
+
+#### Create ROC curve of the test 
+
+Use the predict function on the xgboost test data and project the values onto the dt_test data set created earlier. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+ggplot(dt_test, aes(d = default, m = prediction)) + 
+  geom_roc() + 
+  theme_bw()
+
+```
+
+
+#### Calculate AUC of prediction 
+
+Use the AUC function on the predicted data to calculate the area-under-the-curve of above ROC curve. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+auc(dt_test$default, dt_test$prediction)
+
+```
+
+#### Create a 101 Sequence Grid Search of all possible confusion matrices values 
+
+Sequence between 0 and 1 by .01 to create a grid search value string to use to find best cut line on ROC. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+Sequences = seq(0,1, by = .01)
+
+Sequences
+```
+
+
+#### Custom Confusion Matrix Calcluator (GridConfuser)
+
+Calculates all Correct predictions, False Positives, and False Negatives across all values in the grid search. From that calculation, create a confusion matrix for each each grid search. Finally, create a bar plot of each confustion matrix and return all elements in the output.  
+
+```{r,  message=FALSE, warning=FALSE}
+GridConfuser <- lapply(Sequences, function(x) {
+  
+  
+  dt <- dt_test %>% 
+    mutate(test = ifelse(prediction >= x, 1, 0)
+           , confuser = ifelse(test == 1 & default == 1, "Correct_Default",
+                             ifelse(test == 0 & default == 0, "Correct_Non_Default",
+                                    ifelse(test == 1 & default == 0, "False_Positive",
+                                           ifelse(test == 0 & default == 1, "False_Negative",NA))))
+    )
+  
+  ConfusionMatrix <- dt %>% 
+    group_by(confuser) %>% 
+    summarize(Count = n()) %>%
+    t() %>% 
+    data.frame(., row.names = NULL) 
+  
+    names(ConfusionMatrix) <- as.character(unlist(ConfusionMatrix[1,]))
+  
+    ConfusionMatrix <- ConfusionMatrix[-1, ] %>% 
+    mutate(Sequence = x) 
+    
+
+plotme <- ggplot(dt, aes(x = confuser)) +
+  geom_bar() +
+  theme_bw()
+  
+
+output <- list(data = dt
+               , plot = plotme
+, table = ConfusionMatrix)
+
+})
+
+```
+
+
+
+#### Display Confusion Matrix Bar Plots 
+
+Bar Plot outputs from above Confusion can be displayed at any level of the grid search. A manual search can be done of these outputs. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+GridConfuser[[61]]$plot 
+
+GridConfuser[[16]]$plot
+
+```
+
+
+#### Bind All Grid Confusion matrices into a data frame and calculate errors
+
+Bind all the confusion matrices (GridConfuser output) into a data table to compare the accuracy of each based on the model outputs. In the next iteration, I would weight each False_Positive and False_Negative based on its actual impact on the business. In this case, a false negative seems more detrimental than a false positive because a default loan is more costly than not granting a loan that would have not been defaulted on. But...banking is weird so I am sure there is a point where a default loan is a positive if the payor paid long enough.  
+
+The "Errors" value calculated is a sum of Type I and Type II errors. They are equally weighted for now, weighting can be done here to more 'smartly' select the best cutline. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+dt_ConfusionGrid <- rbindlist(lapply(GridConfuser, function(x){x[[3]]}), use.names = T, fill = T) %>% 
+  tbl_df() %>% 
+  mutate_all(funs(ifelse(is.na(.), 0, as.numeric(as.character(.))))) %>%
+  mutate(Errors = (as.numeric(False_Positive) + as.numeric(False_Negative)) ) %>%
+  select(Correct_Default, Correct_Non_Default, False_Positive, False_Negative, Errors, Sequence) %>% 
+  arrange(Errors)
+
+data.table(dt_ConfusionGrid)
+
+```
+
+
+#### Select Best ROC cut line based on the above output
+
+For now, the 'Sequence' corresponding to the lowest value of Errors is chosen to be the value used for the final cut line. There may be a few more elegant ways to select this based on the weighting of False_Positive and False_Negative values as mentioned above. This rough cut is easier to explain to an audience. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+ggplot(dt_test, aes(d = default, m = prediction)) + 
+  geom_roc() + 
+  theme_bw()
+
+cutLine <- as.numeric(unlist(dt_ConfusionGrid[1,"Sequence"]))
+
+cutLine
+
+```
+
+#### Create Final Test Predictions
+
+Using the above cutline, make a final prediction for each test value. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+dt_test <- dt_test %>%
+  mutate(finalPrediction = ifelse(prediction >= cutLine, "default", "non_default")
+         , default = ifelse(default == 1, "default", "non_default"))
+
+data.table(dt_test)
+
+```
+
+
+#### Create Final Model Confusion Matrix metrics
+
+Using the above cutline, make a final prediction for each test value. 
+
+```{r,  message=FALSE, warning=FALSE}
+
+xtab <- confusionMatrix(table(dt_test$default, dt_test$finalPrediction))
+
+xtab
+```
+
+
+Final Accuracy of model is .88. It's an effective model that can be improved a little more with deep tuning. But for this exercise, I am happy with the outcome.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
